@@ -5,7 +5,7 @@
 
 GITHUB_RAW_URL="https://raw.githubusercontent.com/ddl-wasanthag/domino-workspace-audit-trail-load-testing/main/domino_audit_trail_load_test_v2.py"
 SCRIPT_PATH="/tmp/domino_audit_trail_load_test_v2.py"
-DATASET_PATH="/domino/datasets/local/loadgen-audittrail"
+DATASET_PATH="/domino/datasets/local/$DOMINO_PROJECT_NAME"
 
 # --- Tune these for your load profile ---
 LIFECYCLES=1000    # complete file lifecycles per workspace
@@ -14,8 +14,8 @@ FILE_SIZE_KB=64    # file size per operation
 DEDUP_READS=0      # set > 0 on a subset of workspaces to validate dedup
 # ----------------------------------------
 
-echo "[audit-loadgen] Installing dependencies..."
-pip install --quiet psutil || echo "[audit-loadgen] WARNING: pip install failed"
+echo "[audit-loadgen] Project       : $DOMINO_PROJECT_NAME"
+echo "[audit-loadgen] Dataset path  : $DATASET_PATH"
 
 echo "[audit-loadgen] Downloading test script..."
 curl --silent --show-error --fail --location "$GITHUB_RAW_URL" -o "$SCRIPT_PATH" || {
