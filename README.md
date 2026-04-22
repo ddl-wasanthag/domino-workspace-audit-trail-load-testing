@@ -1,12 +1,26 @@
 # Domino Workspace File Access Audit Trail — Load & Impact Test
 
-A diagnostic script for measuring the performance overhead and operational
-impact of enabling **Workspace File Access Auditing** on a Domino deployment.
-It targets the Falco-based audit pipeline that tracks file-level activity on
-Domino Datasets and NetApp Volumes.
+A toolkit for exercising the **Workspace File Access Auditing** pipeline on a
+Domino deployment. It targets the Falco-based audit pipeline that tracks
+file-level activity on Domino Datasets and NetApp Volumes.
+
+The repo ships three generations of the load-test script, each tuned for a
+different purpose. Pick the one that matches your job:
+
+| Script | Profile | Use for |
+|---|---|---|
+| `domino_audit_trail_load_test.py` (v1) | Single-workspace diagnostic: idle baseline + heavy I/O + dedup + Audit API verification + Parquet row count | Measuring per-pod Falco overhead and verifying the full pipeline end-to-end from one workspace |
+| `domino_audit_trail_load_test_v2.py` (v2) | Fleet-oriented: fast file lifecycles with N parallel workers | Saturating the pipeline with raw event volume |
+| **`domino_audit_trail_load_test_v4.py` (v4, recommended)** | **Fleet-oriented: statistical-programmer burst simulation with realistic idle gaps and read/write/stat/delete mix** | **Fleet-scale load tests launched inside up to several hundred concurrent workspaces via the Loadgen tool, to approximate production audit traffic without the hammering signature of v2** |
 
 > **Feature availability:** Workspace File Access Auditing was introduced in
 > **Domino 6.2.0**.
+
+The bulk of this README covers v4 because it is the script that drives current
+fleet-scale testing. The v1 and v2 scripts remain in the repo for their
+original use cases. For v1's Phase 4 API verification, per-workspace resource
+sampling, and `--trigger-processing` flow, see the header docstring inside
+`domino_audit_trail_load_test.py` directly.
 
 ---
 
@@ -44,141 +58,94 @@ Understanding the architecture helps interpret test results correctly.
 
 ---
 
-## What the script tests
+## What v4 does
 
-The test runs four sequential phases and produces a final report.
+The v4 script simulates the dataset I/O footprint of one statistical compute
+(SCE) programmer working on a clinical study for ~15 minutes, then cleans up.
+It is designed to run inside each of many concurrent workspaces launched by
+the Loadgen tool. Aggregated across the fleet, the event stream approximates
+production audit traffic without the unrealistic all-at-once saturation
+signature of the v2 stress test.
 
-### Phase 1 — Baseline Resource Snapshot
+### Session timeline per workspace
 
-Samples CPU and RSS memory every 0.5 seconds for 5 seconds at idle, before any
-file I/O begins. This establishes the starting point against which all
-subsequent overhead is measured as a delta.
+```
+[ 0s    – ~30s ]  SESSION START — "morning load" of SDTM-style reads
+[ ~30s  – ~15m ]  WORKING       — Poisson bursts of program runs
+                                   (reads → writes → stat/delete)
+[ ~15m  – ~16m ]  WIND-DOWN     — final small burst
+[ ~16m  – ~18m ]  CLEANUP       — delete any remaining session files
+[ ~18m  – ~20m ]  idle          — safety buffer before the Loadgen tool's
+                                   20-minute kill switch fires
+```
 
-**Why it matters:** Without an idle snapshot you cannot distinguish
-audit-attributable overhead from pre-existing workspace resource consumption.
+A hard deadline guard inside the script ensures the session never runs past
+`--duration-min` minutes, and `--duration-min` is auto-clamped to leave a
+2-minute buffer before the 20-minute kill switch.
 
-**Caveat:** All measurements reflect the **test process only**. The Falco
-sidecar daemon runs as a separate pod-level process. For its true resource
-footprint, compare `/grafana-workload` metrics taken with auditing OFF versus ON
-under equivalent workload conditions. Falco dropping more than **5% of events**
-is the threshold at which Domino considers it a health concern.
+### Statistical profile (defaults)
 
-### Phase 2 — High-Frequency Mixed File I/O Stress Test
+| Parameter | Distribution | Default |
+|---|---|---|
+| Morning-load reads | Uniform | 8–15 |
+| Pre-created input files | Fixed | 8 |
+| Morning pause before work begins | Uniform | 5–30 s |
+| Number of working bursts | Poisson | λ = 12 |
+| Burst size | Log-normal (clamped 3–20) | mean ~7.4 ops |
+| Inter-burst idle gap | Exponential | mean 75 s |
+| Intra-burst op spacing | Exponential | mean 0.3 s |
+| Op mix within a burst | Weighted | 60% read / 25% write / 15% stat+delete |
+| Overwrite probability on write | Bernoulli | 0.5 |
+| Wind-down burst size | Uniform | 3–8 ops |
+| Max files resident in the session pool | Hard cap | 50 |
 
-Launches N parallel worker threads, each running a tight loop of all five
-Domino-audited file operation types against a temporary subdirectory inside the
-target Dataset or NetApp Volume:
+### Per-workspace volume
 
-| Operation | Frequency |
-|-----------|-----------|
-| Create    | Every iteration |
-| Write     | Every iteration (overwrite a random existing file) |
-| Read      | Every iteration (read a random existing file) |
-| Rename    | ~20% of iterations |
-| Delete    | When per-worker file pool exceeds 50 files |
+Expected total ops per workspace at the defaults: **~130–150 events**, broken
+down roughly as:
 
-CPU and memory are sampled every second. Ops/sec throughput and filesystem
-errors are tracked. All five operations are included because each maps to a
-distinct Falco rule with its own capture cost — a read-only workload would miss
-write and rename overhead entirely.
+```
+~25 ops  morning load     (8 creates + 8–15 reads)
+~96 ops  working phase    (12 bursts × ~8 ops)
+~5  ops  wind-down
+~5–15    cleanup deletes  (whatever remains in the pool)
+─────────────────────────────────────────────────
+~130–150 events / workspace
+```
 
-**Pass/fail thresholds:**
+### Fleet-level budget
 
-| Metric | Threshold | Basis |
-|--------|-----------|-------|
-| CPU overhead (delta vs baseline) | ≤ 20% | Domino publishes ~15%; we add 5% margin |
-| Memory overhead (delta vs baseline) | ≤ 15 MB | Relative process-level margin |
-| I/O error rate | < 1% | Zero tolerance for filesystem contention |
+For *N* workspaces all running v4 concurrently:
 
-### Phase 3 — Deduplication Window Validation
+```
+Total Falco events ≈ N × (~135 + dedup_reads + 2)
+```
 
-Reads a single marker file as fast as possible (every 100 ms) for a
-configurable window (default: 30 seconds), generating hundreds of read events
-against the same path. The filename is printed during the run so you can search
-for it in the Audit App later.
+A concrete example matching the observed prod peak:
 
-Domino deduplicates audit events — repeated access to the same file by the same
-user within a configurable window is collapsed to a single event. Read and write
-dedup windows are configured **independently**:
+- 200 concurrent workspaces × ~135 events = **~27,000 events per 20-minute cohort**
+- Sustained at a 200-concurrent plateau: **~80,000 events/hour**
+- Sustained event rate: **~22–25 events/sec** fleet-wide, with short bursts
+  into the hundreds of events/sec when program runs happen to line up
 
-| Config key | Default | Controls |
-|------------|---------|---------|
-| `com.cerebro.domino.workspaceFileAudit.UniqueReadEventPeriodInMinutes` | 60 min | Read event dedup window |
-| `com.cerebro.domino.workspaceFileAudit.UniqueWriteEventPeriodInMinutes` | 60 min | Write event dedup window |
+### Optional Phase 2 — dedup validation
 
-Both default to **60 minutes**, meaning a file read hundreds of times within an
-hour produces only one audit event. This is critical for ML training loops and
-ETL pipelines that read the same dataset file in a tight loop.
+Unchanged from v2/v3. Reads a single file `--dedup-reads` times to verify the
+pipeline deduplicates repeated reads within `UniqueReadEventPeriodInMinutes`.
+The pipeline should collapse N reads into **1 event**. The filename is printed
+so you can search for it in the Audit App post-run.
 
-**Verification (manual, post-run):** After the pipeline processing window has
-elapsed, ask a Domino admin to open the Workspace File Audit App and search for
-the `dedup_test_*.txt` filename printed during the run. Expect **1 event**. A
-large count means deduplication is not working as expected.
+### Session artefacts and cleanup
 
-### Phase 4 — Audit API: Processing, Status & Event File Verification
+Each run:
 
-Uses the three real Workspace File Audit Trail API endpoints to verify that the
-pipeline processed Phase 2 events and that output Parquet files are accessible.
+- Creates a per-run subdirectory `audit_loadgen_<rand>/` inside `--dataset-path`
+- Tracks every file it creates in an in-memory pool
+- Deletes every tracked file at the end (including any that survived because of
+  an error) so the dataset is left clean
+- Removes the per-run subdirectory after cleanup
 
-#### Important: admin-only access
-
-**All audit API endpoints require Domino admin permissions.** This is by design
-and enforced at the API level — the official Audit App runs with admin-level
-credentials via Domino's app infrastructure. A regular user API key will receive
-a **403 Forbidden**, which the script handles gracefully as a `SKIP` (not a
-failure).
-
-If you are not a Domino admin, skip Phase 4 and verify events via the Audit App
-instead (see [Verifying events without admin access](#verifying-events-without-admin-access)).
-
-#### The three real API endpoints
-
-Confirmed from the [Workspace-File-Audit-Application](https://github.com/dominodatalab/Workspace-File-Audit-Application)
-source code. All paths are relative to the external Domino URL:
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| `POST` | `/api/workspace-audit/v1/process` | Trigger an immediate processing run |
-| `GET`  | `/api/workspace-audit/v1/process/latest` | Status of the most recent run |
-| `GET`  | `/api/workspace-audit/v1/events/download-urls` | Pre-signed URLs for Parquet output files |
-
-Key details discovered from the app source:
-
-- The base path is `/api/workspace-audit` — **not** `/workspace-file-audit` and
-  **not** proxied through `nucleus-frontend`
-- The download-urls endpoint takes **nanosecond** Unix timestamps:
-  `?startTimestamp=<epoch_ns>&endTimestamp=<epoch_ns>`
-- The response is a **plain list of pre-signed URL strings**, not objects
-- Authentication uses the `Authorization` header in the app, but
-  `X-Domino-Api-Key` also works from scripts
-- The URL must be the **external Domino hostname** (same as your browser) —
-  `DOMINO_API_HOST` resolves to `nucleus-frontend` internally which cannot
-  route audit traffic
-
-#### Phase 4 steps
-
-1. **Trigger processing** (optional) — `POST /api/workspace-audit/v1/process`
-   to run a batch immediately instead of waiting for the scheduled 60-minute
-   interval. Requires admin access.
-2. **Poll status** — `GET /api/workspace-audit/v1/process/latest` until
-   processing reports completion (or timeout after 10 minutes).
-3. **Fetch download URLs** — `GET /api/workspace-audit/v1/events/download-urls`
-   called three times to measure API latency variance.
-4. **Download and count Parquet rows** — downloads the most recent Parquet file
-   and counts event rows using `pyarrow` or `pandas` (whichever is installed).
-
-**Pass/fail thresholds:**
-
-| Metric | Threshold |
-|--------|-----------|
-| Download-URL API avg latency | ≤ 5000 ms |
-| Parquet event rows | > 0 |
-
-### Phase 5 — Final Report
-
-Collates all measurements into a tabulated summary with pass/fail results, an
-interpretation section, and sizing recommendations. Results are saved to
-`audit_trail_test_results.json`.
+Nothing is written outside the configured dataset path.
 
 ---
 
@@ -187,92 +154,129 @@ interpretation section, and sizing recommendations. Results are saved to
 - Python 3.8+
 - Run **inside a Domino Workspace** with a Dataset or NetApp Volume mounted
 - Workspace file access auditing must be **enabled** in admin settings before
-  running — the script measures the overhead of an active pipeline
-- **Domino 6.2.0 or later** — this feature does not exist in earlier versions
-- Phase 4 requires a **Domino admin API key** — a regular user key will get 403
+  running — v4 measures aggregate load against an active pipeline
+- **Domino 6.2.0 or later**
 
 ### Python dependencies
 
 ```bash
-pip install psutil requests tabulate
-
-# Optional but recommended for Phase 4 Parquet row counting
-pip install pyarrow
+pip install requests     # only needed when --results-project is set
 ```
+
+No other third-party packages are required for v4. (`psutil`, `tabulate`,
+`pyarrow` etc. are only used by the v1 diagnostic.)
 
 ---
 
 ## Usage
 
-### Minimal run — I/O stress only (Phases 1–3)
-
-Suitable for non-admin users. Generates all resource overhead measurements and
-the dedup validation file. Verify events in the Audit App afterwards.
+### Minimal run (no upload, no dedup phase)
 
 ```bash
-python domino_audit_trail_load_test.py \
-    --dataset-path /domino/datasets/local/my_dataset
-```
-
-### Full run with immediate processing trigger (admin only)
-
-Triggers the pipeline immediately after Phase 2 instead of waiting 60 minutes.
-Results in end-to-end validation within minutes.
-
-```bash
-python domino_audit_trail_load_test.py \
-    --dataset-path   /domino/datasets/local/my_dataset \
-    --domino-url     https://domino-dev.myorg.com \
-    --api-key        $DOMINO_USER_API_KEY \
-    --trigger-processing
-```
-
-### Full run with scheduled-batch wait (admin only)
-
-Waits for the next scheduled pipeline batch (65 minutes) then queries the API.
-
-```bash
-python domino_audit_trail_load_test.py \
-    --dataset-path         /domino/datasets/local/my_dataset \
-    --domino-url           https://domino-dev.myorg.com \
-    --api-key              $DOMINO_USER_API_KEY \
-    --check-api-lag-minutes 65
-```
-
-### Higher load simulation
-
-```bash
-python domino_audit_trail_load_test.py \
+python domino_audit_trail_load_test_v4.py \
     --dataset-path /domino/datasets/local/my_dataset \
-    --workers      16 \
-    --duration     600 \
-    --file-size-kb 512
+    --duration-min 15
 ```
+
+### Typical fleet run — uploads summary + log to a safe project
+
+Recommended pattern when launched by the Loadgen tool: every workspace writes
+its per-run artefacts to a dedicated Domino project that survives after
+Loadgen cleans up the test workspace and project.
+
+```bash
+python domino_audit_trail_load_test_v4.py \
+    --dataset-path      /domino/datasets/local/my_dataset \
+    --duration-min      15 \
+    --dedup-reads       200 \
+    --results-project   admin/audit-loadtest-results \
+    --results-dir       falco_logs \
+    --domino-url        https://domino-dev.myorg.com \
+    --api-key           $DOMINO_USER_API_KEY
+```
+
+### Launched during workspace startup by the Loadgen tool
+
+Use the provided `prerun_v4.sh` as the Domino pre-run script. It downloads
+the latest version of `domino_audit_trail_load_test_v4.py` from GitHub and
+invokes it with the configured flags. See the
+[Pre-run integration with the Loadgen tool](#pre-run-integration-with-the-loadgen-tool)
+section below.
 
 ---
 
-## CLI Reference
+## CLI Reference (v4)
 
 | Flag | Required | Default | Description |
-|------|----------|---------|-------------|
+|---|---|---|---|
 | `--dataset-path` | Yes | — | Path to a mounted Domino Dataset or NetApp Volume |
-| `--domino-url` | No | — | **External** Domino URL (e.g. `https://domino-dev.myorg.com`). Do NOT use `$DOMINO_API_HOST` — it resolves to `nucleus-frontend` internally which cannot route audit API traffic |
-| `--api-key` | No | `$DOMINO_USER_API_KEY` | Domino API key. **Must be an admin key** for Phase 4; a regular key will receive 403 |
-| `--duration` | No | `300` | Duration of the Phase 2 I/O stress test (seconds) |
-| `--workers` | No | `4` | Number of parallel I/O worker threads |
+| `--duration-min` | No | `15` | Target active session length in minutes. Auto-clamped to leave a 2-min safety buffer before the Loadgen kill switch (≤18 min for the default 20-min switch) |
 | `--file-size-kb` | No | `64` | Size of each test file (KB) |
-| `--dedup-window-seconds` | No | `30` | Duration of the Phase 3 repeated-read window (seconds) |
-| `--trigger-processing` | No | off | Immediately trigger pipeline processing via `POST /api/workspace-audit/v1/process` after Phase 2, instead of waiting for the scheduled batch. Admin key required. |
-| `--check-api-lag-minutes` | No | `0` (skip) | Wait N minutes for the scheduled batch before querying the API. Ignored if `--trigger-processing` is set. |
+| `--dedup-reads` | No | `0` | Number of repeated reads on a single file for dedup validation (`0` disables Phase 2) |
+| `--results-project` | No | — | Safe Domino project for uploading run artefacts in the form `owner/projectName`. If unset, no upload is performed |
+| `--results-dir` | No | `falco_logs` | Subdirectory within the safe project where artefacts are written |
+| `--domino-url` | No | `$DOMINO_API_HOST` | **External** Domino URL. Do NOT use the internal `nucleus-frontend` address — Files API traffic is not proxied through it |
+| `--api-key` | No | `$DOMINO_USER_API_KEY` | Domino API key used for the safe-project upload |
+
+The v1 flags `--workers`, `--duration`, `--trigger-processing`,
+`--check-api-lag-minutes`, and `--dedup-window-seconds` are not used by v4.
+
+---
+
+## Pre-run integration with the Loadgen tool
+
+The [Loadgen tool](https://github.com/ddl-wasanthag/loadgen) launches many
+Domino workspaces in parallel. Each workspace can be configured to run a
+pre-run script at startup; this is how v4 is exercised at fleet scale.
+
+### prerun_v4.sh
+
+Located at the repo root. Downloads the latest v4 script from GitHub and
+runs it with Loadgen-friendly defaults. All tunables are shell variables at
+the top of the file:
+
+```bash
+DURATION_MIN=15            # Active session length
+FILE_SIZE_KB=64            # File size per op
+DEDUP_READS=0              # Enable dedup validation on a subset of workspaces
+
+# Optional upload config — leave RESULTS_PROJECT empty to skip upload
+RESULTS_PROJECT=""         # e.g. admin/audit-loadtest-results
+RESULTS_DIR="falco_logs"
+DOMINO_URL=""              # External Domino URL (same one you use in the browser)
+```
+
+`DOMINO_USER_API_KEY` is supplied automatically by the Domino workspace
+environment.
+
+The script always `exit 0`s at the end — a load-test failure will never prevent
+the workspace itself from starting, which matters because Loadgen uses
+workspace startup success as the signal that ramp-up is progressing.
+
+### Recommended fleet configuration
+
+Matching the current `full.conf` settings in the Loadgen Helm chart:
+
+| Loadgen setting | Value | Why |
+|---|---|---|
+| `ramp-up.max-workspaces` | 500 (or higher) | Total workspaces over the run |
+| `ramp-up.interval` | 6 s | Gives ~200 concurrent at steady state (= kill_switch / interval) |
+| `soak.duration` | 30–60 min | Hold 200 concurrent through the soak |
+| `shutdown.kill-switch-delay` | 1200 s (20 min) | Per-workspace lifetime cap |
+| `shutdown.grace-period` | 30 min | Time for all workspaces to shut down after soak |
+
+At those settings, each workspace runs v4 for ~15 minutes of active audit
+activity and sits idle for ~5 minutes before the kill switch fires, producing
+a realistic burst pattern across the fleet.
 
 ---
 
 ## Central Config reference
 
-All settings are managed via Domino Central Config:
+All audit-pipeline settings are managed via Domino Central Config:
 
 | Key | Default | Description |
-|-----|---------|-------------|
+|---|---|---|
 | `com.cerebro.domino.workspaceFileAudit.eventProcessingInMinutes` | 60 | Batch processing interval in minutes (rolling timer, min 60, max 360) |
 | `com.cerebro.domino.workspaceFileAudit.UniqueReadEventPeriodInMinutes` | 60 | Read event deduplication window (minutes) |
 | `com.cerebro.domino.workspaceFileAudit.UniqueWriteEventPeriodInMinutes` | 60 | Write event deduplication window (minutes) |
@@ -291,30 +295,30 @@ cron. This means:
   cycle before it is processed
 
 **In practice, worst-case lag is close to 2× the configured interval.** At the
-default 60-minute setting, events can take up to ~2 hours to appear. This is
-important to communicate clearly to compliance and security teams — this feature
-is designed for **retrospective audit and governance**, not real-time monitoring
-or SOC alerting.
+default 60-minute setting, events can take up to ~2 hours to appear. Communicate
+this clearly to compliance and security teams — this feature is designed for
+**retrospective audit and governance**, not real-time monitoring or SOC alerting.
 
 ---
 
 ## Verifying events without admin access
 
-If you are not a Domino admin, Phase 4 API calls will return 403 (expected).
-Use this workflow instead:
+If you are not a Domino admin, the Audit API endpoints (and therefore the v1
+Phase 4 verification) will return 403. Use this workflow for v4 runs instead:
 
-1. Run the script normally — Phases 1–3 complete without admin rights and
-   generate all the auditable file events.
-2. Note the `io_start_wall` timestamp and the `dedup_test_*.txt` filename from
-   the console output (both are also saved in `audit_trail_test_results.json`).
-3. After the 60-minute pipeline processing window, ask a Domino admin to:
+1. Run v4 normally — it generates all the auditable file events and either
+   prints a `JSON_SUMMARY: …` line to stdout or uploads the summary to the safe
+   project set by `--results-project`.
+2. Note the `start_wall` timestamp and, if enabled, the dedup `test_file_name`
+   from the summary.
+3. After the pipeline processing window has elapsed, ask a Domino admin to:
    - Open the **Workspace File Audit App**
-   - Filter by the `dedup_test_*.txt` filename — expect **1 event**
-   - Filter by time range starting from `io_start_wall` — expect audit events
-     for `audit_test_*.bin` files from Phase 2
+   - Filter by the dedup filename — expect **1 event**
+   - Filter by the session time range — expect bursts of events for
+     `sdtm_*.bin`, `adam_*.bin`, and `bootstrap_*.bin` files
 4. Alternatively, ask the admin to trigger processing immediately via the
    **Sync** button in the Audit App (or `POST /api/workspace-audit/v1/process`)
-   so you don't have to wait the full 60 minutes.
+   so you do not have to wait the full 60 minutes.
 
 ---
 
@@ -322,36 +326,52 @@ Use this workflow instead:
 
 ### Console output
 
-The script prints a structured log throughout each phase explaining what is
-being measured and why, with a live ticker during Phase 2 showing elapsed time,
-cumulative ops, instantaneous ops/sec, CPU, memory, and error count.
+Every run prints a structured, timestamped log of each phase plus a progress
+ticker every 10 seconds with cumulative ops, instantaneous ops/sec, pool size,
+and elapsed time.
 
-### audit_trail_test_results.json
+### `JSON_SUMMARY` stdout line
 
-Written to the working directory on completion:
+At the end of every run, v4 prints a single-line JSON summary prefixed with
+`JSON_SUMMARY: ` (and, when upload is enabled, `UPLOAD_RESULT: `). Example:
 
 ```json
 {
-  "baseline":     { "cpu_avg_pct": ..., "mem_avg_mb": ... },
-  "io_result":    { "cpu_avg_pct": ..., "ops": {...}, "errors": [...],
-                    "io_start_wall": "2026-04-14T09:00:00+00:00",
-                    "io_end_wall":   "2026-04-14T09:05:00+00:00" },
-  "dedup_result": { "file_reads": ..., "expected_events": 1,
-                    "test_file_name": "dedup_test_xxxxxxxx.txt" },
-  "api_result":   { "processing_status": ..., "avg_url_latency_ms": ...,
-                    "parquet_row_count": ..., "admin_required": false },
-  "summary":      { "cpu_overhead_pct": ..., "error_rate_pct": ..., ... }
+  "workspace_id":    "run-a1b2c3d4",
+  "dataset_path":    "/domino/datasets/local/my_dataset",
+  "duration_min":    15,
+  "burst_count":     13,
+  "total_ops":       142,
+  "ops_per_sec":     0.16,
+  "duration_s":      893.4,
+  "error_count":     0,
+  "ops":             { "read": 84, "write": 35, "stat": 9, "delete": 14, "rename": 0 },
+  "start_wall":      "2026-04-22T09:00:00+00:00",
+  "end_wall":        "2026-04-22T09:14:53+00:00",
+  "falco_events_est": 142,
+  "dedup":           null,
+  "profile_version": "v4-burst"
 }
 ```
 
 Key fields to share with a Domino admin or Support:
 
-- `io_start_wall` / `io_end_wall` — UTC timestamps of the Phase 2 window; use
-  as the time range filter in the Audit App or provide to Support if events are
-  missing
-- `dedup_result.test_file_name` — filename to search for in the Audit App to
-  verify deduplication
-- `api_result.admin_required` — `true` if Phase 4 was blocked by 403
+- `start_wall` / `end_wall` — UTC timestamps of the session window; use as the
+  time range filter in the Audit App or provide to Support if events are missing
+- `dedup.test_file_name` — filename to search for in the Audit App to verify
+  deduplication (only present when `--dedup-reads > 0`)
+
+### Safe-project upload (optional)
+
+When `--results-project owner/projectName` is set, v4 uploads two files into
+`<project>/<results-dir>/` before exiting:
+
+- `audit_loadgen_<DOMINO_RUN_ID>_<UTC_ts>.json` — run summary
+- `audit_loadgen_<DOMINO_RUN_ID>_<UTC_ts>.log`  — full console trace
+
+The upload uses `PUT /v1/projects/{owner}/{name}/files/{path}` with the
+`X-Domino-Api-Key` header. If the upload fails it is logged as a warning but
+never fails the run.
 
 ---
 
@@ -361,50 +381,44 @@ Key fields to share with a Domino admin or Support:
   (e.g. small → medium). Domino's published overhead estimates are ~15% CPU and
   ~10% memory per workspace pod. Heavy I/O workloads (ML data ingestion, ETL,
   large Parquet reads) will sit toward the upper end.
-- **Scale `--workers`** to match your expected concurrent-workspace count. Start
-  with `--workers 4` for interactive workloads; increase toward `--workers 16`
-  for data-intensive teams.
+- **For fleet load testing, use v4's `--duration-min` rather than `--workers`.**
+  v4 models one workspace as one simulated programmer (single-threaded), which
+  matches how the audit pipeline sees real user activity. Parallelism comes
+  from running many workspaces via the Loadgen tool, not from threads inside
+  one workspace.
 - **Adjust `--file-size-kb`** to match typical file sizes. The default 64 KB
-  stresses high-syscall-rate small-file overhead. For workloads with large model
-  checkpoints or multi-GB datasets, use 512 KB–4 MB.
+  stresses high-syscall-rate small-file overhead. For workloads with large
+  model checkpoints or multi-GB datasets, use 512 KB – 4 MB.
 
 ---
 
 ## Troubleshooting
 
-**Phase 2 reports I/O errors**
+**The script reports I/O errors**
 The filesystem experienced contention. This may be caused by Falco consuming
-enough resources under high event rates to slow write throughput. Reduce
-`--workers` or upgrade the hardware tier and re-run.
+enough resources under high event rates to slow write throughput. Reduce the
+fleet concurrency (increase `ramp-up.interval` in the Loadgen chart) or
+upgrade the hardware tier and re-run.
 
-**Phase 4 returns 403 Forbidden**
-Expected for non-admin users. All audit API endpoints require Domino admin
-permissions. See [Verifying events without admin access](#verifying-events-without-admin-access).
+**The working phase fires 0 bursts in the logs**
+This happens when `--duration-min` is set too short (≤ ~1 min). The morning
+pause and the wind-down reserve leave no time for the working phase. Use
+`--duration-min 15` (the default) for production runs; short-duration smoke
+tests will correctly skip straight from morning load to cleanup.
 
-**Phase 4 returns 404**
-The most common cause is using `$DOMINO_API_HOST` as the URL, which resolves to
-`nucleus-frontend.domino-platform` internally. The audit service is not proxied
-through nucleus-frontend. Always pass the **external Domino URL** explicitly:
-`--domino-url https://domino-dev.myorg.com`.
+**Upload returns HTTP 404**
+The most common cause is using `$DOMINO_API_HOST` as the URL, which resolves
+to `nucleus-frontend.domino-platform` internally. The Files API is not proxied
+through nucleus-frontend. Always pass the **external Domino URL** explicitly
+via `--domino-url https://domino-dev.myorg.com`.
 
-**Phase 4 shows zero rows in Parquet after triggering processing**
-Possible causes:
-1. Processing completed before Phase 2 events were staged — trigger again after
-   a short wait
-2. Audit Trail was not enabled before the test ran — check admin settings
-3. The time range filter in `download-urls` did not overlap with event
-   timestamps — check `io_start_wall` in the JSON output
-
-**Phase 4 download-URL latency exceeds 5000 ms**
-The Parquet files are monthly aggregates that grow throughout the month. Query
-performance may degrade toward month-end on high-activity deployments.
-
-**Baseline CPU is already above 10%**
-Another process is consuming resources. Close other notebooks, terminals, or
-background jobs and re-run for cleaner overhead measurements.
+**Upload returns HTTP 403**
+The API key lacks write permission to the safe project. Confirm the key
+belongs to a user who owns or is a contributor on `owner/projectName`.
 
 **Grafana shows Falco dropping events (> 5% drop rate)**
 Two patterns to distinguish:
+
 - *Sudden spike, processing drops to zero* — likely a service crash. Restart
   Falco and Falco Sidekick in the `domino-platform` namespace and monitor.
 - *Sustained elevated drops during peak activity* — likely buffer overflow.
@@ -423,8 +437,8 @@ Two patterns to distinguish:
   captured events. Requires Domino admin access. Supports filtering by user,
   project, dataset/volume, file path, event type, date range, and workspace.
 - **Domino Support** — if events are missing or significantly delayed beyond the
-  expected processing window, provide the `io_start_wall` and `io_end_wall`
-  timestamps from the JSON output and the affected workspace details.
+  expected processing window, provide the `start_wall` and `end_wall`
+  timestamps from the JSON summary and the affected workspace details.
 - In **Domino Cloud deployments**, Domino's platform team monitors the audit
   pipeline infrastructure and manages all underlying alerts automatically.
 
